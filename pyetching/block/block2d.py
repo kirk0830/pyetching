@@ -167,7 +167,7 @@ class ElasticBlock2D(Block2D):
         super().__init__(r, a, b)
         
         assert isinstance(f, (int, float))
-        assert 1 > f >= 0
+        assert 1 >= f >= 0
         self.f = f
         
     def interact(self, src, v):
@@ -426,8 +426,7 @@ class ChemicalBlock2D(Block2D):
         assert rxn is None or isinstance(rxn, dict)
         self.rxn = rxn
 
-class PhysicalScatterBlock2D(WeightedBlock2D,
-                             ElasticBlock2D,
+class PhysicalScatterBlock2D(ElasticBlock2D,
                              PermeableBlock2D):
     '''the block can interact with the incident particles
     by elastic scattering and permeation.
@@ -459,12 +458,11 @@ class PhysicalScatterBlock2D(WeightedBlock2D,
             permeation. 1.0 means a fully permeation
             without any energy loss.
         '''
-                
-        WeightedBlock2D.__init__(self, r, a, b, w)
-        ElasticBlock2D.__init__(self, r, a, b, felastic)
-        PermeableBlock2D.__init__(self, r, a, b, fpermeable)
-        
+        self.w = w
         assert felastic + fpermeable <= 1 # energy conservation
+        
+        ElasticBlock2D.__init__(self, r, a, b, felastic)
+        PermeableBlock2D.__init__(self, r, a, b, fpermeable)        
 
     def interact(self, src, v):
         '''interact with the incident particles
@@ -481,7 +479,7 @@ class PhysicalScatterBlock2D(WeightedBlock2D,
         tuple of np.ndarray
             the new source point and the new velocity vector
         '''
-        WeightedBlock2D.interact(self, 1 - self.f) # transfer the energy loss to the weight
+        self.w -= 0.1
         return ElasticBlock2D.interact(self, src, v)
 
 class EtchableBlock2D(ChemicalBlock2D, PhysicalScatterBlock2D):
@@ -522,15 +520,6 @@ class EtchableBlock2D(ChemicalBlock2D, PhysicalScatterBlock2D):
                 
         ChemicalBlock2D.__init__(self, r, a, b, rxn)
         PhysicalScatterBlock2D.__init__(self, r, a, b, w, felastic, fpermeable)
-
-'''
-then the evolution would be like this:
-
-for i in range(n):
-    r, v = incident_particles()
-    while v >= 0:
-        r, v = all_blocks().interact(r, v)
-'''
 
 if __name__ == '__main__':
     unittest.main()

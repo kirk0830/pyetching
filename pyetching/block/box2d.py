@@ -3,6 +3,9 @@ the box that containes blocks for 2D MC modeling
 '''
 import unittest
 import itertools as it
+import multiprocessing as mp
+import os
+from typing import Callable, Generator
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -146,7 +149,18 @@ class BlockBox2D(Box2D):
         Parameters
         ----------
         f : callable
-            the function to allocate the block
+            the function to instantiate the block, should be
+            configured so that only three parameters are left
+            to be passed, i.e. the center of the block, the
+            length and width of the block. e.g.
+            ```python
+            # the simplest
+            def f(r, a, b):
+                return Block2D(r, a, b)
+            # or
+            def f(r, a, b):
+                return SomeBlock2D(r, a, b, f=1.0)
+            ```
         '''
         assert callable(f)
         
@@ -261,54 +275,20 @@ class TestBlockBox2D(unittest.TestCase):
                 self.assertEqual(i, box.up(box.down(i)))
                     
     def test_allocate(self):
-        from pyetching.block.block2d import \
-            Block2D, ElasticBlock2D, PermeableBlock2D, WeightedBlock2D,\
-                PhysicalScatterBlock2D
+        from pyetching.block.block2d import Block2D
                 
         box = BlockBox2D(a=10, b=20, nbx=5, nby=10)
         def f(r, a, b):
             return Block2D(r, a, b)
         box.allocate(f)
         self.assertEqual(len(box.blocks), 50)
+        
         for block in box.blocks:
             self.assertIsInstance(block, Block2D)
             self.assertTrue(block.r in box.centers)
             self.assertEqual(block.a, box.a / box.nbx)
             self.assertEqual(block.b, box.b / box.nby)
         
-        def f(r, a, b):
-            return ElasticBlock2D(r, a, b, f=1.0)
-        box.allocate(f)
-        self.assertEqual(len(box.blocks), 50)
-        for block in box.blocks:
-            self.assertIsInstance(block, ElasticBlock2D)
-            self.assertTrue(block.r in box.centers)
-            self.assertEqual(block.a, box.a / box.nbx)
-            self.assertEqual(block.b, box.b / box.nby)
-            self.assertEqual(block.f, 1.0)
-            
-        def f(r, a, b):
-            return PermeableBlock2D(r, a, b, f=1.0)
-        box.allocate(f)
-        self.assertEqual(len(box.blocks), 50)
-        for block in box.blocks:
-            self.assertIsInstance(block, PermeableBlock2D)
-            self.assertTrue(block.r in box.centers)
-            self.assertEqual(block.a, box.a / box.nbx)
-            self.assertEqual(block.b, box.b / box.nby)
-            self.assertEqual(block.f, 1.0)
-            
-        def f(r, a, b):
-            return WeightedBlock2D(r, a, b, w=1.0)
-        box.allocate(f)
-        self.assertEqual(len(box.blocks), 50)
-        for block in box.blocks:
-            self.assertIsInstance(block, WeightedBlock2D)
-            self.assertTrue(block.r in box.centers)
-            self.assertEqual(block.a, box.a / box.nbx)
-            self.assertEqual(block.b, box.b / box.nby)
-            self.assertEqual(block.w, 1.0)
-
 class EtchingBox2D(BlockBox2D):
     
     def __init__(self, a, b, nbx, nby, 
@@ -332,38 +312,144 @@ class EtchingBox2D(BlockBox2D):
         '''
         super().__init__(a, b, nbx, nby, pbc)
     
-    def set_etch_source(self, src, v, a, **kwargs):
-        '''initialize the etching source
+    def dist(self, a, b):
+        '''calculate the distance between two points'''
+        assert isinstance(a, np.ndarray)
+        assert isinstance(b, np.ndarray)
+        assert a.shape == (2,)
+        assert b.shape == (2,)
+        if not self.pbc:
+            return np.linalg.norm(a - b)
+        
+        cell = np.array([[self.a, 0], [0, self.b]])
+        direct_a = np.linalg.solve(cell, a)
+        direct_b = np.linalg.solve(cell, b)
+        direct_dist = (direct_a - direct_b + 0.5) % 1 - 0.5
+        return np.linalg.norm(np.dot(cell, direct_dist))
+    
+    def etch(self, etchgen, n: int, nthread: int=1, vthr: float=1e-6):
+        '''perform etching for n particles (till each particle's
+        velocity is zero)
         
         Parameters
         ----------
-        src : np.ndarray
-            the source position
-        v : tuple
-            the mean and stddev of the velocity of the source
-        a : tuple
-            the range of angles of the source emission
-        vmin : float
-            optional, the minimum velocity of the source
-        vmax : float
-            optional, the maximum velocity of the source
+        f : Generator
+            the generator function to generate etching particles,
+            should yield the source position and velocity of the particle.
+            should have 1 parameter, i.e. the number of particles to etch.
+            e.g.
+            ```python
+            def etchgen(n):
+                for _ in range(n):
+                    yield np.array([0.0, 0.0]), np.random.normal(1.0, 0.1)
+            ```
+        n : int
+            the number of particles to etch
+        nthread : int
+            the number of threads to use for etching, default is 1
+        vthr : float
+            the threshold of velocity, below which the particle is assumed
+            to be stopped. default is 1e-6
         '''
-        assert isinstance(src, np.ndarray)
-        assert src.shape == (2,)
+        assert callable(etchgen)
+        assert isinstance(n, int)
+        assert n > 0
+        assert self.blocks is not None
+        assert len(self.blocks) > 0
+
+        print('')
+        for src, v in etchgen(n):
+            while np.linalg.norm(v) >= vthr:
+                # the following part can be highly parallelized. 
+                print('before:\n', [b.w for b in self.blocks])
+                print('r:\n', [b.r for b in self.blocks if b.w > 0])
+                temp = [b.interact(src, v) for b in self.blocks if b.w > 0]
+                print('after:\n', [b.w for b in self.blocks])
+                # exclude those not interacted
+                temp = [t for t in temp if np.linalg.norm(t[1] - src) >= 1e-6]
+                if not temp:
+                    break
+                i = np.argmin([self.dist(src, np.array(t[0])) for t in temp])
+                src, v = temp[i]
+                src = np.array(src)
+                print(f'Etching particle at {src} with velocity {v}')
+                
+    def display(self):
+        '''display the weights of all blocks in the hotmap
+        '''
+        assert self.blocks is not None
+        assert len(self.blocks) > 0
+        w = np.array([b.w for b in self.blocks]).reshape(self.nby, self.nbx)
+        fig, ax = plt.subplots()
+        ax.imshow(w, cmap='hot', interpolation='nearest')
+        # add colorscale
+        cbar = plt.colorbar(ax.imshow(w, cmap='hot', interpolation='nearest'))
+        cbar.set_label('Weight')
+        ax.set_title('Weight of blocks')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_xticks(np.arange(self.nbx))
+        ax.set_yticks(np.arange(self.nby))
+        return fig, ax
+
+class TestEtchingBox2D(unittest.TestCase):
+    def test_init(self):
+        a = 10
+        b = 20
+        nbx = 5
+        nby = 10
+        pbc = True
+        box = EtchingBox2D(a, b, nbx, nby, pbc)
+        self.assertEqual(box.a, a)
+        self.assertEqual(box.b, b)
         
-        assert isinstance(v, tuple)
-        assert len(v) == 2
-        assert all(isinstance(vi, (int, float)) for vi in v)
+        self.assertEqual(box.nbx, nbx)
+        self.assertEqual(box.nby, nby)
         
-        assert isinstance(a, tuple)
-        assert len(a) == 2
-        assert all(isinstance(ai, (int, float)) for ai in a)
+        self.assertEqual(box.pbc, pbc)
         
-        def f():
-            '''generate the velocity of the source'''
-            mean, stddev = v
-            
+        self.assertEqual(len(box.centers), nbx * nby)
+        for center in box.centers:
+            self.assertEqual(len(center), 2)
+            self.assertTrue(center[0] >= 0)
+            self.assertTrue(center[0] <= a)
+            self.assertTrue(center[1] >= 0)
+            self.assertTrue(center[1] <= b)
+        for ix, iy in it.product(range(nbx), range(nby)):
+            i = box.xy2i(ix, iy)
+            self.assertEqual((ix, iy), box.i2xy(i))
+
+    def test_etch(self):
+        box = EtchingBox2D(a=10, b=20, nbx=5, nby=10)
         
+        def etchgen(n):
+            vmean, vstddev = 1.0, 0.1
+            amin, amax = 0, np.pi
+            for _ in range(n):
+                v = np.random.normal(vmean, vstddev)
+                theta = np.random.uniform(amin, amax)
+                yield np.array([5.0, 0.0]), \
+                    v * np.array([np.cos(theta), np.sin(theta)])
         
+        # first test the generator
+        v = np.array([p[1] for p in etchgen(1000)])
+        self.assertEqual(v.shape, (1000, 2))
+        vmean = np.mean([np.linalg.norm(v_) for v_ in v])
+        vstddev = np.std([np.linalg.norm(v_) for v_ in v])
+        self.assertAlmostEqual(vmean, 1.0, delta=0.1)
+        self.assertAlmostEqual(vstddev, 0.1, delta=0.1)
+        
+        from pyetching.block.block2d import PhysicalScatterBlock2D
+        def f(r, a, b):
+            return PhysicalScatterBlock2D(r, a, b, w=10.0, felastic=0.5, fpermeable=0)
+        
+        box.allocate(f)
+        box.etch(etchgen, 1, nthread=1, vthr=1e-6)
+        
+        # test the display function
+        fig, ax = box.display()
+        plt.savefig('test.png')
+        plt.close()
+
 if __name__ == '__main__':
     unittest.main()
